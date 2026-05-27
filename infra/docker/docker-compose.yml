@@ -1,0 +1,16 @@
+services:
+  workers:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    env_file: ../../.env
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - engageiq
+
+networks:
+  engageiq:
+    name: docker_engageiq
+    external: true
