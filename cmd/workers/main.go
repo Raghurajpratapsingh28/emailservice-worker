@@ -74,9 +74,8 @@ func main() {
 		Stream:         "DOMAIN",
 		Subject:        "domain.verify.poll",
 		DurableName:    "domain-verify-worker",
-		MaxDeliver:     sesWorker.MaxAttempts,
-		AckWait:        2 * time.Minute,
-		BackOff:        sesWorker.RetryDelays,
+		MaxDeliver:     -1,
+		AckWait:        60 * time.Second,
 		Handler:        domainHandler.Handle,
 		HandlerTimeout: 30 * time.Second,
 	}); err != nil {

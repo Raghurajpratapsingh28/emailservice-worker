@@ -7,8 +7,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/ses"
+	sesv1 "github.com/aws/aws-sdk-go-v2/service/ses"
 	sestypes "github.com/aws/aws-sdk-go-v2/service/ses/types"
+	sesv2 "github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/aws/smithy-go"
 	"go.uber.org/zap"
 )
@@ -21,25 +22,34 @@ const (
 	StatusFailed   VerificationStatus = "Failed"
 )
 
-// API abstracts the subset of SES operations the workers use.
+// API abstracts the subset of SES v1 operations the workers use.
 type API interface {
-	GetIdentityVerificationAttributes(ctx context.Context, in *ses.GetIdentityVerificationAttributesInput, opts ...func(*ses.Options)) (*ses.GetIdentityVerificationAttributesOutput, error)
-	SendEmail(ctx context.Context, in *ses.SendEmailInput, opts ...func(*ses.Options)) (*ses.SendEmailOutput, error)
+	GetIdentityVerificationAttributes(ctx context.Context, in *sesv1.GetIdentityVerificationAttributesInput, opts ...func(*sesv1.Options)) (*sesv1.GetIdentityVerificationAttributesOutput, error)
+	SendEmail(ctx context.Context, in *sesv1.SendEmailInput, opts ...func(*sesv1.Options)) (*sesv1.SendEmailOutput, error)
+}
+
+// APIV2 abstracts SES v2 operations used for domain identity checks.
+type APIV2 interface {
+	GetEmailIdentity(ctx context.Context, in *sesv2.GetEmailIdentityInput, opts ...func(*sesv2.Options)) (*sesv2.GetEmailIdentityOutput, error)
 }
 
 type Client struct {
 	api    API
+	apiv2  APIV2
 	logger *zap.Logger
 }
 
-// NewClient builds an SES client using the standard AWS SDK credential chain
-// (env vars AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, IAM role, shared config).
+// NewClient builds SES v1 + v2 clients using the standard AWS credential chain.
 func NewClient(ctx context.Context, region string, logger *zap.Logger) (*Client, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
-	return &Client{api: ses.NewFromConfig(cfg), logger: logger}, nil
+	return &Client{
+		api:    sesv1.NewFromConfig(cfg),
+		apiv2:  sesv2.NewFromConfig(cfg),
+		logger: logger,
+	}, nil
 }
 
 // NewClientWithAPI wires a custom API (used by tests).
@@ -47,25 +57,25 @@ func NewClientWithAPI(api API, logger *zap.Logger) *Client {
 	return &Client{api: api, logger: logger}
 }
 
-// CheckDomainVerification queries SES for domain verification status.
+// CheckDomainVerification uses SES v2 GetEmailIdentity to check DKIM status.
+// Domains created via SES v2 must be verified this way.
 func (c *Client) CheckDomainVerification(ctx context.Context, domain string) (VerificationStatus, error) {
-	out, err := c.api.GetIdentityVerificationAttributes(ctx, &ses.GetIdentityVerificationAttributesInput{
-		Identities: []string{domain},
+	out, err := c.apiv2.GetEmailIdentity(ctx, &sesv2.GetEmailIdentityInput{
+		EmailIdentity: aws.String(domain),
 	})
 	if err != nil {
 		return StatusFailed, fmt.Errorf("ses get verification: %w", err)
 	}
-	attrs, ok := out.VerificationAttributes[domain]
-	if !ok {
+	if out.DkimAttributes == nil {
 		return StatusPending, nil
 	}
-	switch string(attrs.VerificationStatus) {
-	case "Success":
+	switch string(out.DkimAttributes.Status) {
+	case "SUCCESS":
 		return StatusVerified, nil
-	case "Pending":
-		return StatusPending, nil
-	default:
+	case "FAILED", "TEMPORARY_FAILURE":
 		return StatusFailed, nil
+	default:
+		return StatusPending, nil
 	}
 }
 
@@ -129,7 +139,7 @@ func (c *Client) SendEmail(ctx context.Context, in SendEmailInput) (SendEmailOut
 		})
 	}
 
-	out, err := c.api.SendEmail(ctx, &ses.SendEmailInput{
+	out, err := c.api.SendEmail(ctx, &sesv1.SendEmailInput{
 		Source:           aws.String(source),
 		Destination:      &sestypes.Destination{ToAddresses: in.To},
 		Message:          msg,

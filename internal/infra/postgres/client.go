@@ -83,7 +83,7 @@ func (c *Client) UpdateDomainFailed(ctx context.Context, domainID, workspaceID s
 // ============================================================
 
 func (c *Client) GetEmailSendStatus(ctx context.Context, sendID, workspaceID string) (string, error) {
-	const q = `SELECT status FROM email_sends WHERE id = $1 AND workspace_id = $2`
+	const q = `SELECT status FROM email_sends WHERE send_id = $1 AND workspace_id = $2`
 	var status string
 	err := c.Pool.QueryRow(ctx, q, sendID, workspaceID).Scan(&status)
 	if err != nil {
@@ -98,7 +98,7 @@ func (c *Client) GetEmailSendStatus(ctx context.Context, sendID, workspaceID str
 func (c *Client) UpdateEmailSendSending(ctx context.Context, sendID, workspaceID string) error {
 	const q = `UPDATE email_sends
 		SET status = 'sending', updated_at = NOW()
-		WHERE id = $1 AND workspace_id = $2 AND status IN ('queued', 'failed', 'sending')`
+		WHERE send_id = $1 AND workspace_id = $2 AND status IN ('queued', 'failed', 'sending')`
 	_, err := c.Pool.Exec(ctx, q, sendID, workspaceID)
 	return err
 }
@@ -109,7 +109,7 @@ func (c *Client) UpdateEmailSendSent(ctx context.Context, sendID, workspaceID, p
 		    provider_message_id = $3,
 		    failure_reason = NULL,
 		    updated_at = NOW()
-		WHERE id = $1 AND workspace_id = $2 AND status NOT IN ('bounced')`
+		WHERE send_id = $1 AND workspace_id = $2 AND status NOT IN ('bounced')`
 	_, err := c.Pool.Exec(ctx, q, sendID, workspaceID, providerMessageID)
 	return err
 }
@@ -119,7 +119,7 @@ func (c *Client) UpdateEmailSendFailed(ctx context.Context, sendID, workspaceID,
 		SET status = 'failed',
 		    failure_reason = $3,
 		    updated_at = NOW()
-		WHERE id = $1 AND workspace_id = $2 AND status NOT IN ('sent', 'bounced')`
+		WHERE send_id = $1 AND workspace_id = $2 AND status NOT IN ('sent', 'bounced')`
 	_, err := c.Pool.Exec(ctx, q, sendID, workspaceID, reason)
 	return err
 }
