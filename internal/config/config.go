@@ -18,7 +18,8 @@ type Config struct {
 	EventBatchSize     int    `envconfig:"EVENT_BATCH_SIZE" default:"100"`
 	SegmentMaxRetries  int    `envconfig:"SEGMENT_MAX_RETRIES" default:"5"`
 	WorkflowMaxRetries int    `envconfig:"WORKFLOW_MAX_RETRIES" default:"5"`
-	WorkflowSchedulerPollInterval time.Duration `envconfig:"WORKFLOW_SCHEDULER_POLL_INTERVAL" default:"30s"`
+	WorkflowSchedulerPollInterval  time.Duration `envconfig:"WORKFLOW_SCHEDULER_POLL_INTERVAL" default:"30s"`
+	CampaignSchedulerPollInterval  time.Duration `envconfig:"CAMPAIGN_SCHEDULER_POLL_INTERVAL" default:"60s"`
 }
 
 func Load() (*Config, error) {

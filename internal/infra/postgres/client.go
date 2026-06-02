@@ -149,7 +149,7 @@ func (c *Client) FetchSegmentContactsBatch(
 	const q = `
 		SELECT c.id, c.email, COALESCE(c.first_name, '')
 		FROM contacts c
-		INNER JOIN segment_members sm
+		INNER JOIN segment_memberships sm
 		        ON sm.contact_id = c.id
 		       AND sm.workspace_id = c.workspace_id
 		WHERE c.workspace_id = $1
@@ -663,12 +663,12 @@ func (c *Client) UpdateSegmentReady(ctx context.Context, segmentID, workspaceID 
 }
 
 // ============================================================
-// segment_members table
+// segment_memberships table
 // ============================================================
 
 // GetCurrentMemberIDs returns the set of contact IDs currently in the segment.
 func (c *Client) GetCurrentMemberIDs(ctx context.Context, segmentID, workspaceID string) (map[string]struct{}, error) {
-	const q = `SELECT contact_id FROM segment_members
+	const q = `SELECT contact_id FROM segment_memberships
 		WHERE segment_id = $1 AND workspace_id = $2`
 	rows, err := c.Pool.Query(ctx, q, segmentID, workspaceID)
 	if err != nil {
@@ -692,7 +692,7 @@ func (c *Client) InsertSegmentMembers(ctx context.Context, segmentID, workspaceI
 	if len(contactIDs) == 0 {
 		return nil
 	}
-	const q = `INSERT INTO segment_members (segment_id, workspace_id, contact_id, created_at)
+	const q = `INSERT INTO segment_memberships (segment_id, workspace_id, contact_id, created_at)
 		VALUES ($1, $2, $3, NOW())
 		ON CONFLICT (segment_id, contact_id) DO NOTHING`
 	tx, err := c.Pool.Begin(ctx)
@@ -713,7 +713,7 @@ func (c *Client) DeleteSegmentMembers(ctx context.Context, segmentID, workspaceI
 	if len(contactIDs) == 0 {
 		return nil
 	}
-	const q = `DELETE FROM segment_members
+	const q = `DELETE FROM segment_memberships
 		WHERE segment_id = $1 AND workspace_id = $2 AND contact_id = $3`
 	tx, err := c.Pool.Begin(ctx)
 	if err != nil {
@@ -994,4 +994,69 @@ func (c *Client) FetchDueExecutions(ctx context.Context, limit int) ([]Execution
 // GetContactForWorkflow loads the minimal contact data needed to send an email.
 func (c *Client) GetContactForWorkflow(ctx context.Context, contactID, workspaceID string) (*ContactRow, error) {
 	return c.FindContactByUserID(ctx, workspaceID, contactID)
+}
+
+// ============================================================
+// campaign scheduler
+// ============================================================
+
+// DueCampaign holds the fields needed to fire a scheduled campaign.
+type DueCampaign struct {
+	ID          string
+	WorkspaceID string
+	SegmentID   string
+	SenderEmail string
+	SenderName  string
+	ReplyTo     string
+	Subject     string
+	HTMLBody    string
+	TextBody    string
+}
+
+// GetDueCampaigns returns up to limit campaigns whose scheduled_at has passed
+// and are still in 'scheduled' status. Atomically transitions them to 'sending'
+// so no other scheduler instance picks them up.
+func (c *Client) GetDueCampaigns(ctx context.Context, limit int) ([]DueCampaign, error) {
+	const q = `
+		UPDATE campaigns
+		SET    status     = 'sending',
+		       started_at = COALESCE(started_at, NOW()),
+		       updated_at = NOW()
+		WHERE  id IN (
+		    SELECT id FROM campaigns
+		    WHERE  status       = 'scheduled'
+		      AND  scheduled_at <= NOW()
+		      AND  deleted_at   IS NULL
+		    ORDER  BY scheduled_at
+		    LIMIT  $1
+		    FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, workspace_id,
+		          COALESCE(segment_id::text, '')   AS segment_id,
+		          COALESCE(sender_email, '')        AS sender_email,
+		          COALESCE(sender_name,  '')        AS sender_name,
+		          COALESCE(reply_to,     '')        AS reply_to,
+		          COALESCE(subject,      '')        AS subject,
+		          COALESCE(html_body,    '')        AS html_body,
+		          COALESCE(text_body,    '')        AS text_body`
+
+	rows, err := c.Pool.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get due campaigns: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DueCampaign
+	for rows.Next() {
+		var d DueCampaign
+		if err := rows.Scan(
+			&d.ID, &d.WorkspaceID, &d.SegmentID,
+			&d.SenderEmail, &d.SenderName, &d.ReplyTo,
+			&d.Subject, &d.HTMLBody, &d.TextBody,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }

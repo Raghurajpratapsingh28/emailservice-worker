@@ -187,6 +187,10 @@ func main() {
 		logger.Fatal("workflow register consumer register failed", zap.Error(err))
 	}
 
+	// --- Campaign scheduler (fires scheduled campaigns when scheduled_at passes) ---
+	campaignScheduler := emailWorker.NewCampaignScheduler(db, publisher, cfg.CampaignSchedulerPollInterval, logger)
+	go campaignScheduler.Run(rootCtx)
+
 	// --- Workflow delay scheduler (background goroutine) ---
 	executor := workflowsWorker.NewExecutor(db, publisher, logger)
 	scheduler := workflowsWorker.NewScheduler(db, executor, rdb, cfg.WorkflowSchedulerPollInterval, logger)
