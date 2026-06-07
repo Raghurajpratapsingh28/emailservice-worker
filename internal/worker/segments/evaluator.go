@@ -14,18 +14,17 @@ import (
 
 // FilterNode is a node in the filter tree. It is either a logical group
 // (AND/OR with children) or a leaf condition.
+// JSON shape matches what the Node/Fastify API stores in the segments.filter_tree JSONB column:
+//   group: { "operator": "AND"|"OR", "rules": [...] }
+//   rule:  { "field": "...", "operator": "...", "value": ... }
 type FilterNode struct {
-	// Logical group fields
-	Logic    string        `json:"logic,omitempty"` // "AND" | "OR"
-	Children []*FilterNode `json:"children,omitempty"`
+	// Logical group fields — "operator" is used for both group logic AND rule operator
+	Operator string        `json:"operator,omitempty"` // "AND" | "OR" for groups; rule operator for leaves
+	Rules    []*FilterNode `json:"rules,omitempty"`    // non-nil → this is a group
 
 	// Leaf condition fields
-	Field    string      `json:"field,omitempty"`
-	Operator string      `json:"operator,omitempty"`
-	Value    interface{} `json:"value,omitempty"`
-
-	// Event filter (special leaf)
-	EventName string `json:"eventName,omitempty"` // non-empty → event filter
+	Field string      `json:"field,omitempty"`
+	Value interface{} `json:"value,omitempty"`
 }
 
 // EventChecker checks whether a contact has performed a named event.
@@ -64,25 +63,36 @@ func (e *Evaluator) Matches(ctx context.Context, workspaceID string, ct *postgre
 }
 
 func (e *Evaluator) eval(ctx context.Context, workspaceID string, ct *postgres.ContactForEval, node *FilterNode) (bool, error) {
-	// Logical group
-	if node.Logic != "" {
+	// Logical group — has Rules children
+	if len(node.Rules) > 0 {
 		return e.evalLogic(ctx, workspaceID, ct, node)
 	}
-	// Event filter leaf
-	if node.EventName != "" {
-		return e.events.ContactHasPerformedEvent(ctx, workspaceID, ct.ID, node.EventName)
+	// Event filter leaf — field starts with "event:"
+	if strings.HasPrefix(node.Field, "event:") {
+		eventName := strings.TrimPrefix(node.Field, "event:")
+		switch node.Operator {
+		case "exists":
+			return e.events.ContactHasPerformedEvent(ctx, workspaceID, ct.ID, eventName)
+		case "not_exists":
+			ok, err := e.events.ContactHasPerformedEvent(ctx, workspaceID, ct.ID, eventName)
+			return !ok, err
+		case "occurred_within_days":
+			// Handled at DB level; fall back to exists check here
+			return e.events.ContactHasPerformedEvent(ctx, workspaceID, ct.ID, eventName)
+		}
+		return false, nil
 	}
 	// Condition leaf
 	return e.evalCondition(ct, node)
 }
 
 func (e *Evaluator) evalLogic(ctx context.Context, workspaceID string, ct *postgres.ContactForEval, node *FilterNode) (bool, error) {
-	if len(node.Children) == 0 {
+	if len(node.Rules) == 0 {
 		return true, nil
 	}
-	switch strings.ToUpper(node.Logic) {
+	switch strings.ToUpper(node.Operator) {
 	case "AND":
-		for _, child := range node.Children {
+		for _, child := range node.Rules {
 			ok, err := e.eval(ctx, workspaceID, ct, child)
 			if err != nil {
 				return false, err
@@ -93,7 +103,7 @@ func (e *Evaluator) evalLogic(ctx context.Context, workspaceID string, ct *postg
 		}
 		return true, nil
 	case "OR":
-		for _, child := range node.Children {
+		for _, child := range node.Rules {
 			ok, err := e.eval(ctx, workspaceID, ct, child)
 			if err != nil {
 				return false, err
@@ -104,7 +114,7 @@ func (e *Evaluator) evalLogic(ctx context.Context, workspaceID string, ct *postg
 		}
 		return false, nil
 	default:
-		return false, fmt.Errorf("unknown logic operator: %q", node.Logic)
+		return false, fmt.Errorf("unknown logic operator: %q", node.Operator)
 	}
 }
 
@@ -116,9 +126,9 @@ func (e *Evaluator) evalCondition(ct *postgres.ContactForEval, node *FilterNode)
 
 	switch node.Operator {
 	case "exists":
-		return fieldVal != nil && fieldVal != "", nil
+		return fieldVal != nil && fmt.Sprintf("%v", fieldVal) != "", nil
 	case "not_exists":
-		return fieldVal == nil || fieldVal == "", nil
+		return fieldVal == nil || fmt.Sprintf("%v", fieldVal) == "", nil
 	}
 
 	if fieldVal == nil {
@@ -149,8 +159,8 @@ func (e *Evaluator) evalCondition(ct *postgres.ContactForEval, node *FilterNode)
 	}
 }
 
-// extractField resolves a dot-notation field path from the contact.
-// Supports top-level fields (email, first_name, etc.) and traits.* / properties.*.
+// extractField resolves a field path from the contact.
+// Supports top-level fields and properties.* for JSONB lookups.
 func extractField(ct *postgres.ContactForEval, field string) (interface{}, error) {
 	switch field {
 	case "email":
@@ -161,18 +171,14 @@ func extractField(ct *postgres.ContactForEval, field string) (interface{}, error
 		return ct.LastName, nil
 	case "phone":
 		return ct.Phone, nil
-	case "user_id", "userId":
-		return ct.UserID, nil
-	case "status":
-		return ct.Status, nil
+	case "lifecycle_stage", "lifecycleStage":
+		return ct.LifecycleStage, nil
+	case "lead_score", "leadScore":
+		return ct.LeadScore, nil
 	case "created_at", "createdAt":
 		return ct.CreatedAt.Format(time.RFC3339), nil
 	}
 
-	// traits.* or properties.*
-	if strings.HasPrefix(field, "traits.") {
-		return extractJSONBField(ct.Traits, strings.TrimPrefix(field, "traits."))
-	}
 	if strings.HasPrefix(field, "properties.") {
 		return extractJSONBField(ct.Properties, strings.TrimPrefix(field, "properties."))
 	}

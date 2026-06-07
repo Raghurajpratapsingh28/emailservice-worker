@@ -255,8 +255,6 @@ func contact(id, email string) postgres.ContactForEval {
 		WorkspaceID: "ws-001",
 		Email:       email,
 		FirstName:   "Test",
-		Status:      "active",
-		Traits:      []byte(`{}`),
 		Properties:  []byte(`{}`),
 		CreatedAt:   time.Now(),
 	}
@@ -471,16 +469,17 @@ func newEval(events map[string]bool) *Evaluator {
 	return NewEvaluator(&mockEventChecker{results: events})
 }
 
-func ct(id, email, firstName string, traits map[string]interface{}) postgres.ContactForEval {
-	traitsJSON, _ := json.Marshal(traits)
+func ct(id, email, firstName string, properties map[string]interface{}) postgres.ContactForEval {
+	propsJSON, _ := json.Marshal(properties)
+	if propsJSON == nil {
+		propsJSON = []byte(`{}`)
+	}
 	return postgres.ContactForEval{
 		ID:          id,
 		WorkspaceID: "ws-001",
 		Email:       email,
 		FirstName:   firstName,
-		Status:      "active",
-		Traits:      traitsJSON,
-		Properties:  []byte(`{}`),
+		Properties:  propsJSON,
 		CreatedAt:   time.Now(),
 	}
 }
@@ -542,7 +541,7 @@ func TestEvaluator_EndsWith(t *testing.T) {
 
 func TestEvaluator_GreaterThan(t *testing.T) {
 	e := newEval(nil)
-	tree := &FilterNode{Field: "traits.age", Operator: "greater_than", Value: float64(25)}
+	tree := &FilterNode{Field: "properties.age", Operator: "greater_than", Value: float64(25)}
 	c := ct("c1", "alice@acme.com", "Alice", map[string]interface{}{"age": float64(30)})
 	ok, _ := e.Matches(context.Background(), "ws-001", &c, tree)
 	if !ok {
@@ -557,7 +556,7 @@ func TestEvaluator_GreaterThan(t *testing.T) {
 
 func TestEvaluator_LessThan(t *testing.T) {
 	e := newEval(nil)
-	tree := &FilterNode{Field: "traits.score", Operator: "less_than", Value: float64(50)}
+	tree := &FilterNode{Field: "properties.score", Operator: "less_than", Value: float64(50)}
 	c := ct("c1", "a@b.com", "A", map[string]interface{}{"score": float64(30)})
 	ok, _ := e.Matches(context.Background(), "ws-001", &c, tree)
 	if !ok {
@@ -567,7 +566,7 @@ func TestEvaluator_LessThan(t *testing.T) {
 
 func TestEvaluator_Exists(t *testing.T) {
 	e := newEval(nil)
-	tree := &FilterNode{Field: "traits.plan", Operator: "exists"}
+	tree := &FilterNode{Field: "properties.plan", Operator: "exists"}
 	c := ct("c1", "a@b.com", "A", map[string]interface{}{"plan": "pro"})
 	ok, _ := e.Matches(context.Background(), "ws-001", &c, tree)
 	if !ok {
@@ -582,7 +581,7 @@ func TestEvaluator_Exists(t *testing.T) {
 
 func TestEvaluator_NotExists(t *testing.T) {
 	e := newEval(nil)
-	tree := &FilterNode{Field: "traits.plan", Operator: "not_exists"}
+	tree := &FilterNode{Field: "properties.plan", Operator: "not_exists"}
 	c := ct("c1", "a@b.com", "A", nil)
 	ok, _ := e.Matches(context.Background(), "ws-001", &c, tree)
 	if !ok {
@@ -592,7 +591,7 @@ func TestEvaluator_NotExists(t *testing.T) {
 
 func TestEvaluator_In(t *testing.T) {
 	e := newEval(nil)
-	tree := &FilterNode{Field: "traits.plan", Operator: "in", Value: []interface{}{"pro", "enterprise"}}
+	tree := &FilterNode{Field: "properties.plan", Operator: "in", Value: []interface{}{"pro", "enterprise"}}
 	c := ct("c1", "a@b.com", "A", map[string]interface{}{"plan": "pro"})
 	ok, _ := e.Matches(context.Background(), "ws-001", &c, tree)
 	if !ok {
@@ -607,7 +606,7 @@ func TestEvaluator_In(t *testing.T) {
 
 func TestEvaluator_NotIn(t *testing.T) {
 	e := newEval(nil)
-	tree := &FilterNode{Field: "traits.plan", Operator: "not_in", Value: []interface{}{"free"}}
+	tree := &FilterNode{Field: "properties.plan", Operator: "not_in", Value: []interface{}{"free"}}
 	c := ct("c1", "a@b.com", "A", map[string]interface{}{"plan": "pro"})
 	ok, _ := e.Matches(context.Background(), "ws-001", &c, tree)
 	if !ok {
@@ -618,10 +617,10 @@ func TestEvaluator_NotIn(t *testing.T) {
 func TestEvaluator_AND_Logic(t *testing.T) {
 	e := newEval(nil)
 	tree := &FilterNode{
-		Logic: "AND",
-		Children: []*FilterNode{
+		Operator: "AND",
+		Rules: []*FilterNode{
 			{Field: "email", Operator: "contains", Value: "@acme.com"},
-			{Field: "traits.plan", Operator: "equals", Value: "pro"},
+			{Field: "properties.plan", Operator: "equals", Value: "pro"},
 		},
 	}
 	c := ct("c1", "alice@acme.com", "Alice", map[string]interface{}{"plan": "pro"})
@@ -639,10 +638,10 @@ func TestEvaluator_AND_Logic(t *testing.T) {
 func TestEvaluator_OR_Logic(t *testing.T) {
 	e := newEval(nil)
 	tree := &FilterNode{
-		Logic: "OR",
-		Children: []*FilterNode{
+		Operator: "OR",
+		Rules: []*FilterNode{
 			{Field: "email", Operator: "contains", Value: "@acme.com"},
-			{Field: "traits.plan", Operator: "equals", Value: "enterprise"},
+			{Field: "properties.plan", Operator: "equals", Value: "enterprise"},
 		},
 	}
 	c := ct("c1", "bob@other.com", "Bob", map[string]interface{}{"plan": "enterprise"})
@@ -656,16 +655,16 @@ func TestEvaluator_NestedLogic(t *testing.T) {
 	e := newEval(nil)
 	// (email contains @acme.com AND plan = pro) OR (plan = enterprise)
 	tree := &FilterNode{
-		Logic: "OR",
-		Children: []*FilterNode{
+		Operator: "OR",
+		Rules: []*FilterNode{
 			{
-				Logic: "AND",
-				Children: []*FilterNode{
+				Operator: "AND",
+				Rules: []*FilterNode{
 					{Field: "email", Operator: "contains", Value: "@acme.com"},
-					{Field: "traits.plan", Operator: "equals", Value: "pro"},
+					{Field: "properties.plan", Operator: "equals", Value: "pro"},
 				},
 			},
-			{Field: "traits.plan", Operator: "equals", Value: "enterprise"},
+			{Field: "properties.plan", Operator: "equals", Value: "enterprise"},
 		},
 	}
 	c1 := ct("c1", "alice@acme.com", "Alice", map[string]interface{}{"plan": "pro"})
@@ -687,7 +686,7 @@ func TestEvaluator_NestedLogic(t *testing.T) {
 
 func TestEvaluator_EventFilter(t *testing.T) {
 	e := newEval(map[string]bool{"c1": true, "c2": false})
-	tree := &FilterNode{EventName: "Trial Started"}
+	tree := &FilterNode{Field: "event:Trial Started", Operator: "exists"}
 	c1 := ct("c1", "a@b.com", "A", nil)
 	ok1, _ := e.Matches(context.Background(), "ws-001", &c1, tree)
 	if !ok1 {
@@ -709,19 +708,19 @@ func TestEvaluator_NilTree_MatchesAll(t *testing.T) {
 	}
 }
 
-func TestEvaluator_TraitsNestedField(t *testing.T) {
+func TestEvaluator_PropertiesNestedField(t *testing.T) {
 	e := newEval(nil)
-	tree := &FilterNode{Field: "traits.address.city", Operator: "equals", Value: "NYC"}
-	traitsJSON, _ := json.Marshal(map[string]interface{}{
+	tree := &FilterNode{Field: "properties.address.city", Operator: "equals", Value: "NYC"}
+	propsJSON, _ := json.Marshal(map[string]interface{}{
 		"address": map[string]interface{}{"city": "NYC"},
 	})
 	c := postgres.ContactForEval{
 		ID: "c1", WorkspaceID: "ws-001", Email: "a@b.com",
-		Traits: traitsJSON, Properties: []byte(`{}`), CreatedAt: time.Now(),
+		Properties: propsJSON, CreatedAt: time.Now(),
 	}
 	ok, _ := e.Matches(context.Background(), "ws-001", &c, tree)
 	if !ok {
-		t.Error("expected match for nested traits field")
+		t.Error("expected match for nested properties field")
 	}
 }
 

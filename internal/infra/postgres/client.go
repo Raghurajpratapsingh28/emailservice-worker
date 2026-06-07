@@ -734,20 +734,19 @@ func (c *Client) DeleteSegmentMembers(ctx context.Context, segmentID, workspaceI
 
 // ContactForEval is a contact row used during filter evaluation.
 type ContactForEval struct {
-	ID         string
-	WorkspaceID string
-	UserID     string
-	Email      string
-	FirstName  string
-	LastName   string
-	Phone      string
-	Status     string
-	Traits     []byte // JSONB
-	Properties []byte // JSONB
-	CreatedAt  time.Time
+	ID             string
+	WorkspaceID    string
+	Email          string
+	FirstName      string
+	LastName       string
+	Phone          string
+	LifecycleStage string
+	LeadScore      int
+	Properties     []byte // JSONB
+	CreatedAt      time.Time
 }
 
-// StreamContactsForEval streams all active contacts in a workspace in pages,
+// StreamContactsForEval streams all non-deleted contacts in a workspace in pages,
 // calling fn for each page. Stops when fn returns an error or no more rows.
 func (c *Client) StreamContactsForEval(
 	ctx context.Context,
@@ -757,12 +756,13 @@ func (c *Client) StreamContactsForEval(
 ) error {
 	afterID := ""
 	for {
-		const q = `SELECT id, workspace_id, COALESCE(user_id,''), COALESCE(email,''),
+		const q = `SELECT id, workspace_id, COALESCE(email,''),
 			COALESCE(first_name,''), COALESCE(last_name,''), COALESCE(phone,''),
-			COALESCE(status,'active'), COALESCE(traits,'{}'), COALESCE(properties,'{}'), created_at
+			COALESCE(lifecycle_stage,'lead'), COALESCE(lead_score,0),
+			COALESCE(properties,'{}'), created_at
 			FROM contacts
 			WHERE workspace_id = $1
-			  AND status = 'active'
+			  AND deleted_at IS NULL
 			  AND ($2 = '' OR id > $2::uuid)
 			ORDER BY id
 			LIMIT $3`
@@ -775,9 +775,10 @@ func (c *Client) StreamContactsForEval(
 		for rows.Next() {
 			var ct ContactForEval
 			if err := rows.Scan(
-				&ct.ID, &ct.WorkspaceID, &ct.UserID, &ct.Email,
-				&ct.FirstName, &ct.LastName, &ct.Phone, &ct.Status,
-				&ct.Traits, &ct.Properties, &ct.CreatedAt,
+				&ct.ID, &ct.WorkspaceID, &ct.Email,
+				&ct.FirstName, &ct.LastName, &ct.Phone,
+				&ct.LifecycleStage, &ct.LeadScore,
+				&ct.Properties, &ct.CreatedAt,
 			); err != nil {
 				rows.Close()
 				return err
