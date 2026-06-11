@@ -58,7 +58,8 @@ func (c *Client) ensureStreams(ctx context.Context) error {
 			Name:      "DOMAIN",
 			Subjects:  []string{"domain.>"},
 			Retention: jetstream.WorkQueuePolicy,
-			MaxAge:    96 * time.Hour,
+			// No MaxAge — the verification poller runs indefinitely.
+			// Domain expiry is handled by DomainCleanupScheduler (default: 30 days).
 		},
 		{
 			Name:      "EMAIL_SEND",

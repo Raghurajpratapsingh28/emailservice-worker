@@ -20,6 +20,10 @@ type Config struct {
 	WorkflowMaxRetries int    `envconfig:"WORKFLOW_MAX_RETRIES" default:"5"`
 	WorkflowSchedulerPollInterval  time.Duration `envconfig:"WORKFLOW_SCHEDULER_POLL_INTERVAL" default:"30s"`
 	CampaignSchedulerPollInterval  time.Duration `envconfig:"CAMPAIGN_SCHEDULER_POLL_INTERVAL" default:"60s"`
+	DomainCleanupInterval          time.Duration `envconfig:"DOMAIN_CLEANUP_INTERVAL" default:"6h"`
+	DomainVerificationStaleAfter   time.Duration `envconfig:"DOMAIN_VERIFICATION_STALE_AFTER" default:"720h"` // 30 days
+	DataCleanupInterval            time.Duration `envconfig:"DATA_CLEANUP_INTERVAL" default:"6h"`
+	DataRetainFor                  time.Duration `envconfig:"DATA_RETAIN_FOR" default:"1080h"` // 45 days
 }
 
 func Load() (*Config, error) {

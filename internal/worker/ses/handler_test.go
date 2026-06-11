@@ -40,9 +40,28 @@ type dbCall struct {
 }
 
 type mockDB struct {
-	mu    sync.Mutex
-	calls []dbCall
-	err   error
+	mu             sync.Mutex
+	calls          []dbCall
+	err            error
+	domainStatus   string // set explicitly; default "" → returns "verifying" (active)
+	statusErr      error
+	statusNotFound bool // true → GetDomainStatus returns ("", nil)
+}
+
+func (m *mockDB) GetDomainStatus(_ context.Context, _, _ string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.statusErr != nil {
+		return "", m.statusErr
+	}
+	if m.statusNotFound {
+		return "", nil
+	}
+	status := m.domainStatus
+	if status == "" {
+		status = "verifying" // default: active domain
+	}
+	return status, nil
 }
 
 func (m *mockDB) UpdateDomainVerified(_ context.Context, domainID, workspaceID string) error {
@@ -63,6 +82,24 @@ func (m *mockDB) UpdateDomainFailed(_ context.Context, domainID, workspaceID str
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, dbCall{"failed", domainID, workspaceID, attempts})
+	return m.err
+}
+
+type publishCall struct {
+	subject string
+	payload any
+}
+
+type mockPublisher struct {
+	mu    sync.Mutex
+	calls []publishCall
+	err   error
+}
+
+func (m *mockPublisher) Publish(_ context.Context, subject string, payload any, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, publishCall{subject, payload})
 	return m.err
 }
 
@@ -101,7 +138,13 @@ var _ jetstream.Msg = (*mockMsg)(nil)
 
 func newTestHandler(ses SESChecker, db DBUpdater) *Handler {
 	logger, _ := zap.NewDevelopment()
-	return NewHandler(ses, db, logger)
+	pub := &mockPublisher{}
+	return NewHandler(ses, db, pub, logger)
+}
+
+func newTestHandlerWithPublisher(ses SESChecker, db DBUpdater, pub EventPublisher) *Handler {
+	logger, _ := zap.NewDevelopment()
+	return NewHandler(ses, db, pub, logger)
 }
 
 func makePayload(t *testing.T, p types.DomainVerifyPayload) []byte {
@@ -115,7 +158,7 @@ func makePayload(t *testing.T, p types.DomainVerifyPayload) []byte {
 
 func defaultPayload(t *testing.T) []byte {
 	return makePayload(t, types.DomainVerifyPayload{
-		DomainID: "00000000-0000-0000-0000-000000000001",
+		DomainID:    "00000000-0000-0000-0000-000000000001",
 		WorkspaceID: "00000000-0000-0000-0000-000000000002",
 		Domain:      "acme.com",
 	})
@@ -126,7 +169,8 @@ func defaultPayload(t *testing.T) []byte {
 func TestHandle_VerifiedDomain_AcksAndUpdates(t *testing.T) {
 	ses := &mockSES{status: infraSes.StatusVerified}
 	db := &mockDB{}
-	h := newTestHandler(ses, db)
+	pub := &mockPublisher{}
+	h := newTestHandlerWithPublisher(ses, db, pub)
 	msg := &mockMsg{data: defaultPayload(t), numDelivered: 1}
 
 	if err := h.Handle(context.Background(), msg); err != nil {
@@ -141,13 +185,17 @@ func TestHandle_VerifiedDomain_AcksAndUpdates(t *testing.T) {
 	if len(db.calls) != 1 || db.calls[0].method != "verified" {
 		t.Fatalf("expected single verified call, got %+v", db.calls)
 	}
+	// Should publish domain.verified.v1 event
+	if len(pub.calls) != 1 || pub.calls[0].subject != SubjectDomainVerified {
+		t.Fatalf("expected verified event published, got %+v", pub.calls)
+	}
 }
 
 func TestHandle_PendingDomain_NaksForBackoff(t *testing.T) {
 	ses := &mockSES{status: infraSes.StatusPending}
 	db := &mockDB{}
 	h := newTestHandler(ses, db)
-	msg := &mockMsg{data: defaultPayload(t), numDelivered: 3}
+	msg := &mockMsg{data: defaultPayload(t), numDelivered: 1}
 
 	if err := h.Handle(context.Background(), msg); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -158,28 +206,62 @@ func TestHandle_PendingDomain_NaksForBackoff(t *testing.T) {
 	if msg.acked || msg.termed {
 		t.Fatal("expected only Nak")
 	}
-	if len(db.calls) != 1 || db.calls[0].method != "pending" || db.calls[0].attempts != 3 {
-		t.Fatalf("expected pending call with attempts=3, got %+v", db.calls)
+	if len(db.calls) != 1 || db.calls[0].method != "pending" {
+		t.Fatalf("expected pending call, got %+v", db.calls)
 	}
 }
 
-func TestHandle_PendingDomain_MaxAttempts_TermsAndMarksFailed(t *testing.T) {
+func TestHandle_PendingDomain_NeverAutoTerminates(t *testing.T) {
+	// The poller should keep retrying indefinitely — it's the cleanup scheduler's
+	// job to expire stale domains, not the poller's.
 	ses := &mockSES{status: infraSes.StatusPending}
 	db := &mockDB{}
 	h := newTestHandler(ses, db)
-	msg := &mockMsg{data: defaultPayload(t), numDelivered: uint64(MaxAttempts)}
 
-	if err := h.Handle(context.Background(), msg); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	for attempt := uint64(1); attempt <= 50; attempt++ {
+		msg := &mockMsg{data: defaultPayload(t), numDelivered: attempt}
+		if err := h.Handle(context.Background(), msg); err != nil {
+			t.Fatalf("attempt %d: unexpected error: %v", attempt, err)
+		}
+		if msg.termed {
+			t.Fatalf("attempt %d: poller should never auto-terminate on pending", attempt)
+		}
+		if !msg.naked {
+			t.Fatalf("attempt %d: expected Nak", attempt)
+		}
 	}
-	if !msg.termed {
-		t.Fatal("expected Term on max attempts")
+}
+
+func TestHandle_PendingDomain_PublishesReminderAtAttempt3(t *testing.T) {
+	ses := &mockSES{status: infraSes.StatusPending}
+	db := &mockDB{}
+	pub := &mockPublisher{}
+	h := newTestHandlerWithPublisher(ses, db, pub)
+
+	// Attempts 1 and 2: no reminder
+	for _, attempt := range []uint64{1, 2} {
+		pub.calls = nil
+		msg := &mockMsg{data: defaultPayload(t), numDelivered: attempt}
+		_ = h.Handle(context.Background(), msg)
+		if len(pub.calls) != 0 {
+			t.Fatalf("attempt %d: expected no reminder, got %+v", attempt, pub.calls)
+		}
 	}
-	if msg.naked || msg.acked {
-		t.Fatal("expected only Term")
+
+	// Attempt 3: reminder published
+	pub.calls = nil
+	msg := &mockMsg{data: defaultPayload(t), numDelivered: ReminderAfterAttempt}
+	_ = h.Handle(context.Background(), msg)
+	if len(pub.calls) != 1 || pub.calls[0].subject != SubjectDomainReminder {
+		t.Fatalf("expected reminder event at attempt %d, got %+v", ReminderAfterAttempt, pub.calls)
 	}
-	if len(db.calls) != 1 || db.calls[0].method != "failed" || db.calls[0].attempts != MaxAttempts {
-		t.Fatalf("expected failed call with attempts=%d, got %+v", MaxAttempts, db.calls)
+
+	// Attempt 4+: no second reminder
+	pub.calls = nil
+	msg = &mockMsg{data: defaultPayload(t), numDelivered: 4}
+	_ = h.Handle(context.Background(), msg)
+	if len(pub.calls) != 0 {
+		t.Fatalf("attempt 4: expected no second reminder, got %+v", pub.calls)
 	}
 }
 
@@ -314,6 +396,41 @@ func TestHandle_DBFailure_OnPending_NaksForRetry(t *testing.T) {
 	}
 }
 
+func TestHandle_DeletedDomain_TerminatesWithoutSES(t *testing.T) {
+	cases := []struct {
+		name string
+		db   *mockDB
+	}{
+		{"status=deleted", &mockDB{domainStatus: "deleted"}},
+		{"status=deleting", &mockDB{domainStatus: "deleting"}},
+		{"not_found", &mockDB{statusNotFound: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ses := &mockSES{status: infraSes.StatusPending}
+			db := tc.db
+			h := newTestHandler(ses, db)
+			msg := &mockMsg{data: defaultPayload(t), numDelivered: 1}
+
+			if err := h.Handle(context.Background(), msg); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !msg.termed {
+				t.Fatal("expected Term for deleted/missing domain")
+			}
+			if msg.acked || msg.naked {
+				t.Fatal("expected only Term")
+			}
+			if ses.calls != 0 {
+				t.Fatal("SES should not be called for deleted domain")
+			}
+			if len(db.calls) != 0 {
+				t.Fatal("DB update should not be called for deleted domain")
+			}
+		})
+	}
+}
+
 func TestNextDelay_MatchesRetrySchedule(t *testing.T) {
 	h := &Handler{}
 	expected := []struct {
@@ -321,14 +438,15 @@ func TestNextDelay_MatchesRetrySchedule(t *testing.T) {
 		want    time.Duration
 	}{
 		{1, 5 * time.Minute},
-		{2, 15 * time.Minute},
-		{3, 30 * time.Minute},
-		{4, 1 * time.Hour},
-		{5, 2 * time.Hour},
-		{6, 6 * time.Hour},
-		{7, 12 * time.Hour},
-		{8, 24 * time.Hour},
-		{9, 24 * time.Hour}, // beyond array, clamps to last
+		{2, 10 * time.Minute},
+		{3, 15 * time.Minute},
+		{4, 30 * time.Minute},
+		{5, 1 * time.Hour},
+		{6, 2 * time.Hour},
+		{7, 6 * time.Hour},
+		{8, 12 * time.Hour},
+		{9, 24 * time.Hour},
+		{10, 24 * time.Hour}, // beyond array, clamps to last
 		{100, 24 * time.Hour},
 	}
 	for _, tt := range expected {
@@ -338,18 +456,14 @@ func TestNextDelay_MatchesRetrySchedule(t *testing.T) {
 	}
 }
 
-func TestRetryBudget_Within72Hours(t *testing.T) {
-	// Sanity check on the schedule meets the 72h SLA.
+func TestRetryBudget_FirstDayCoversCommonCases(t *testing.T) {
+	// Sanity: the first 5 attempts cover a full day of polling.
+	// Common DNS propagation completes within 24h.
 	var total time.Duration
-	for i := 0; i < MaxAttempts-1; i++ {
-		idx := i
-		if idx >= len(RetryDelays) {
-			idx = len(RetryDelays) - 1
-		}
-		total += RetryDelays[idx]
+	for i := 1; i <= len(RetryDelays); i++ {
+		total += RetryDelays[i-1]
 	}
-	limit := 72 * time.Hour
-	if total > limit {
-		t.Errorf("total retry budget %v exceeds %v SLA", total, limit)
+	if total < 24*time.Hour {
+		t.Errorf("first %d retries only cover %v, expected at least 24h", len(RetryDelays), total)
 	}
 }

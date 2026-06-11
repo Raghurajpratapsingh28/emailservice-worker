@@ -20,6 +20,7 @@ import (
 	"engageiq-workers/internal/queue/consumers"
 	"engageiq-workers/internal/queue/producers"
 	"engageiq-workers/internal/ratelimit"
+	cleanupWorker "engageiq-workers/internal/worker/cleanup"
 	emailWorker "engageiq-workers/internal/worker/email"
 	eventsWorker "engageiq-workers/internal/worker/events"
 	segmentsWorker "engageiq-workers/internal/worker/segments"
@@ -69,18 +70,23 @@ func main() {
 	registry := consumers.NewRegistry(natsClient, logger)
 
 	// --- Domain verification consumer ---
-	domainHandler := sesWorker.NewHandler(sesClient, db, logger)
+	domainHandler := sesWorker.NewHandler(sesClient, db, publisher, logger)
 	if err := registry.Register(rootCtx, consumers.ConsumerConfig{
 		Stream:         "DOMAIN",
 		Subject:        "domain.verify.poll",
 		DurableName:    "domain-verify-worker",
-		MaxDeliver:     -1,
+		MaxDeliver:     -1, // unlimited — handler never auto-terminates on pending
 		AckWait:        60 * time.Second,
 		Handler:        domainHandler.Handle,
 		HandlerTimeout: 30 * time.Second,
 	}); err != nil {
 		logger.Fatal("domain consumer register failed", zap.Error(err))
 	}
+
+	// --- Domain cleanup scheduler ---
+	// Expires domains stuck in pending/verifying for > DomainVerificationStaleAfter.
+	domainCleanup := sesWorker.NewDomainCleanupScheduler(db, publisher, cfg.DomainCleanupInterval, cfg.DomainVerificationStaleAfter, logger)
+	go domainCleanup.Run(rootCtx)
 
 	// --- Transactional email consumer ---
 	emailHandler := emailWorker.NewHandler(sesClient, db, limiter, publisher, logger)
@@ -186,6 +192,10 @@ func main() {
 	}); err != nil {
 		logger.Fatal("workflow register consumer register failed", zap.Error(err))
 	}
+
+	// --- Data cleanup scheduler (deletes audit_logs + events older than 45 days) ---
+	dataCleanup := cleanupWorker.NewScheduler(db, cfg.DataCleanupInterval, cfg.DataRetainFor, logger)
+	go dataCleanup.Run(rootCtx)
 
 	// --- Campaign scheduler (fires scheduled campaigns when scheduled_at passes) ---
 	campaignScheduler := emailWorker.NewCampaignScheduler(db, publisher, cfg.CampaignSchedulerPollInterval, logger)

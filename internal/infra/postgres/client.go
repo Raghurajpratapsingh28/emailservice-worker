@@ -46,12 +46,29 @@ func (c *Client) Close() {
 // domains table (domain verification worker)
 // ============================================================
 
+// GetDomainStatus returns the current status of a domain row.
+// Returns ("", nil) when the row does not exist.
+func (c *Client) GetDomainStatus(ctx context.Context, domainID, workspaceID string) (string, error) {
+	const q = `SELECT status FROM domains WHERE id = $1 AND workspace_id = $2`
+	var status string
+	err := c.Pool.QueryRow(ctx, q, domainID, workspaceID).Scan(&status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return status, nil
+}
+
 func (c *Client) UpdateDomainVerified(ctx context.Context, domainID, workspaceID string) error {
 	const q = `UPDATE domains
 		SET status = 'verified',
 		    verified_at = COALESCE(verified_at, NOW()),
 		    updated_at = NOW()
-		WHERE id = $1 AND workspace_id = $2`
+		WHERE id = $1 AND workspace_id = $2
+		  AND deleted_at IS NULL
+		  AND status NOT IN ('deleting', 'deleted')`
 	_, err := c.Pool.Exec(ctx, q, domainID, workspaceID)
 	return err
 }
@@ -62,7 +79,9 @@ func (c *Client) UpdateDomainPending(ctx context.Context, domainID, workspaceID 
 		    verification_attempts = $3,
 		    last_verification_check_at = NOW(),
 		    updated_at = NOW()
-		WHERE id = $1 AND workspace_id = $2`
+		WHERE id = $1 AND workspace_id = $2
+		  AND deleted_at IS NULL
+		  AND status NOT IN ('deleting', 'deleted')`
 	_, err := c.Pool.Exec(ctx, q, domainID, workspaceID, attempts)
 	return err
 }
@@ -73,8 +92,66 @@ func (c *Client) UpdateDomainFailed(ctx context.Context, domainID, workspaceID s
 		    verification_attempts = $3,
 		    last_verification_check_at = NOW(),
 		    updated_at = NOW()
-		WHERE id = $1 AND workspace_id = $2`
+		WHERE id = $1 AND workspace_id = $2
+		  AND deleted_at IS NULL
+		  AND status NOT IN ('deleting', 'deleted')`
 	_, err := c.Pool.Exec(ctx, q, domainID, workspaceID, attempts)
+	return err
+}
+
+// GetStaleVerifyingDomains returns domains that have been in pending/verifying
+// status for longer than staleDuration and are not already deleted. Used by
+// DomainCleanupScheduler to expire abandoned verifications.
+func (c *Client) GetStaleVerifyingDomains(ctx context.Context, staleDuration time.Duration, limit int) ([]StaleVerifyingDomain, error) {
+	const q = `
+		SELECT d.id, d.workspace_id, d.domain,
+		       u.email AS owner_email,
+		       COALESCE(u.first_name, '') AS owner_name
+		FROM domains d
+		JOIN workspaces w ON w.id = d.workspace_id
+		JOIN users u ON u.id = w.owner_user_id
+		WHERE d.status IN ('pending', 'verifying')
+		  AND d.deleted_at IS NULL
+		  AND d.verification_started_at <= NOW() - ($1 * INTERVAL '1 second')
+		ORDER BY d.verification_started_at
+		LIMIT $2`
+	rows, err := c.Pool.Query(ctx, q, staleDuration.Seconds(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("get stale verifying domains: %w", err)
+	}
+	defer rows.Close()
+
+	var out []StaleVerifyingDomain
+	for rows.Next() {
+		var d StaleVerifyingDomain
+		if err := rows.Scan(&d.ID, &d.WorkspaceID, &d.Domain, &d.OwnerEmail, &d.OwnerName); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// StaleVerifyingDomain is returned by GetStaleVerifyingDomains.
+type StaleVerifyingDomain struct {
+	ID          string
+	WorkspaceID string
+	Domain      string
+	OwnerEmail  string
+	OwnerName   string
+}
+
+// MarkDomainExpired transitions a domain from pending/verifying to failed
+// with a note that it expired. Skips rows already in a terminal state.
+func (c *Client) MarkDomainExpired(ctx context.Context, domainID, workspaceID string) error {
+	const q = `UPDATE domains
+		SET status = 'failed',
+		    last_verification_check_at = NOW(),
+		    updated_at = NOW()
+		WHERE id = $1 AND workspace_id = $2
+		  AND status IN ('pending', 'verifying')
+		  AND deleted_at IS NULL`
+	_, err := c.Pool.Exec(ctx, q, domainID, workspaceID)
 	return err
 }
 
@@ -382,6 +459,52 @@ func (c *Client) MarkCampaignRecipientFailed(
 		WHERE id = $1 AND workspace_id = $2 AND status NOT IN ('sent', 'bounced')`
 	_, err := c.Pool.Exec(ctx, q, recipientID, workspaceID, reason)
 	return err
+}
+
+// ============================================================
+// TTL cleanup queries
+// ============================================================
+
+// DeleteOldAuditLogs deletes up to limit audit_log rows older than retainFor.
+// Returns the number of rows deleted.
+func (c *Client) DeleteOldAuditLogs(ctx context.Context, retainFor time.Duration, limit int) (int64, error) {
+	const q = `
+		DELETE FROM audit_logs
+		WHERE id IN (
+			SELECT id FROM audit_logs
+			WHERE created_at < NOW() - ($1 * INTERVAL '1 second')
+			ORDER BY created_at
+			LIMIT $2
+		)`
+	tag, err := c.Pool.Exec(ctx, q, retainFor.Seconds(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete old audit_logs: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteOldEvents deletes up to limit events_raw rows older than retainFor.
+// Two categories are deleted:
+//   - Terminal rows (processed/failed) older than retainFor — normal TTL cleanup.
+//   - Stuck rows (pending/processing) older than retainFor — these were orphaned
+//     by a worker crash and will never finish; keeping them wastes space forever.
+//
+// Cascades automatically to events_enriched and event_debug_logs via FK ON DELETE CASCADE.
+// Returns the number of rows deleted.
+func (c *Client) DeleteOldEvents(ctx context.Context, retainFor time.Duration, limit int) (int64, error) {
+	const q = `
+		DELETE FROM events_raw
+		WHERE id IN (
+			SELECT id FROM events_raw
+			WHERE created_at < NOW() - ($1 * INTERVAL '1 second')
+			ORDER BY created_at
+			LIMIT $2
+		)`
+	tag, err := c.Pool.Exec(ctx, q, retainFor.Seconds(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete old events_raw: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // ============================================================

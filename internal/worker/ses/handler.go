@@ -14,15 +14,37 @@ import (
 	"engageiq-workers/pkg/types"
 )
 
-// RetryDelays and MaxAttempts kept for consumer registration compatibility.
-var RetryDelays = []time.Duration{}
+// RetryDelays defines the backoff schedule between SES verification polls.
+// After the last entry (24h), that value repeats indefinitely — the poller
+// never auto-terminates. Domains that stay unverified for too long are expired
+// by DomainCleanupScheduler (default: 30 days), not by this worker.
+var RetryDelays = []time.Duration{
+	5 * time.Minute,
+	10 * time.Minute,
+	15 * time.Minute,
+	30 * time.Minute,
+	1 * time.Hour,
+	2 * time.Hour,
+	6 * time.Hour,
+	12 * time.Hour,
+	24 * time.Hour,
+}
 
-// MaxAttempts set high so JetStream never terminates the message — handler
-// controls termination (only on StatusFailed or unrecoverable errors).
-const MaxAttempts = -1 // unlimited
-
-// PollInterval is the fixed delay between verification checks.
+// PollInterval is the fallback delay for transient errors (DB/SES unavailable).
 const PollInterval = 30 * time.Second
+
+// ReminderAttempts are the specific attempt numbers at which a "DNS still not
+// found" reminder event is published to nudge the user.
+// ReminderAfterAttempt is the attempt number after which a "DNS still not
+// found" reminder event is published so the user gets an email nudge.
+const ReminderAfterAttempt = 3
+
+// SubjectDomainVerified and SubjectDomainReminder are the NATS subjects
+// published by this worker on state changes.
+const (
+	SubjectDomainVerified  = "domain.verified.v1"
+	SubjectDomainReminder  = "domain.verification.reminder.v1"
+)
 
 var (
 	verifySuccess = promauto.NewCounter(prometheus.CounterOpts{
@@ -48,19 +70,36 @@ type SESChecker interface {
 }
 
 type DBUpdater interface {
+	GetDomainStatus(ctx context.Context, domainID, workspaceID string) (string, error)
 	UpdateDomainVerified(ctx context.Context, domainID, workspaceID string) error
 	UpdateDomainPending(ctx context.Context, domainID, workspaceID string, attempts int) error
 	UpdateDomainFailed(ctx context.Context, domainID, workspaceID string, attempts int) error
 }
 
-type Handler struct {
-	ses    SESChecker
-	db     DBUpdater
-	logger *zap.Logger
+type EventPublisher interface {
+	Publish(ctx context.Context, subject string, payload any, msgID string) error
 }
 
-func NewHandler(ses SESChecker, db DBUpdater, logger *zap.Logger) *Handler {
-	return &Handler{ses: ses, db: db, logger: logger}
+type Handler struct {
+	ses       SESChecker
+	db        DBUpdater
+	publisher EventPublisher
+	logger    *zap.Logger
+}
+
+func NewHandler(ses SESChecker, db DBUpdater, publisher EventPublisher, logger *zap.Logger) *Handler {
+	return &Handler{ses: ses, db: db, publisher: publisher, logger: logger}
+}
+
+func (h *Handler) nextDelay(attempt int) time.Duration {
+	idx := attempt - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(RetryDelays) {
+		idx = len(RetryDelays) - 1
+	}
+	return RetryDelays[idx]
 }
 
 func (h *Handler) Handle(ctx context.Context, msg jetstream.Msg) error {
@@ -89,6 +128,19 @@ func (h *Handler) Handle(ctx context.Context, msg jetstream.Msg) error {
 		zap.Int("attempt", attempt),
 	)
 
+	// Guard: stop polling if the domain was deleted while this message was queued.
+	dbStatus, err := h.db.GetDomainStatus(ctx, payload.DomainID, payload.WorkspaceID)
+	if err != nil {
+		log.Error("db status check failed", zap.Error(err))
+		_ = msg.NakWithDelay(PollInterval)
+		return nil
+	}
+	if dbStatus == "" || dbStatus == "deleting" || dbStatus == "deleted" {
+		log.Info("domain deleted or not found, terminating poll", zap.String("db_status", dbStatus))
+		_ = msg.Term()
+		return nil
+	}
+
 	status, err := h.ses.CheckDomainVerification(ctx, payload.Domain)
 	if err != nil {
 		sesAPIFailures.Inc()
@@ -108,6 +160,11 @@ func (h *Handler) Handle(ctx context.Context, msg jetstream.Msg) error {
 		}
 		verifySuccess.Inc()
 		log.Info("domain verified")
+		h.publishEvent(ctx, SubjectDomainVerified, map[string]any{
+			"domainId":    payload.DomainID,
+			"workspaceId": payload.WorkspaceID,
+			"domain":      payload.Domain,
+		})
 		_ = msg.Ack()
 
 	case infraSes.StatusPending:
@@ -117,8 +174,18 @@ func (h *Handler) Handle(ctx context.Context, msg jetstream.Msg) error {
 			return nil
 		}
 		verifyRetries.Inc()
-		log.Info("domain still pending, retrying in 30s")
-		_ = msg.NakWithDelay(PollInterval)
+		// After ReminderAfterAttempt checks with no DNS found, nudge the user once.
+		if attempt == ReminderAfterAttempt {
+			h.publishEvent(ctx, SubjectDomainReminder, map[string]any{
+				"domainId":    payload.DomainID,
+				"workspaceId": payload.WorkspaceID,
+				"domain":      payload.Domain,
+				"attempt":     attempt,
+			})
+		}
+		delay := h.nextDelay(attempt)
+		log.Info("domain still pending, retrying", zap.Duration("delay", delay))
+		_ = msg.NakWithDelay(delay)
 
 	case infraSes.StatusFailed:
 		if err := h.db.UpdateDomainFailed(ctx, payload.DomainID, payload.WorkspaceID, attempt); err != nil {
@@ -132,4 +199,10 @@ func (h *Handler) Handle(ctx context.Context, msg jetstream.Msg) error {
 	}
 
 	return nil
+}
+
+func (h *Handler) publishEvent(ctx context.Context, subject string, payload map[string]any) {
+	if err := h.publisher.Publish(ctx, subject, payload, ""); err != nil {
+		h.logger.Warn("event publish failed", zap.String("subject", subject), zap.Error(err))
+	}
 }
